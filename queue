@@ -1,0 +1,1759 @@
+#!/usr/bin/perl -w
+#===============================================================================
+# SIMPLE JOB QUEUE MANAGER
+#
+# Invoke with --help for instructions and overview.
+#
+# Revision history:
+#   2015.11.07  Initial version.
+#   2018.03.16  Allow user to specify a priority when adding jobs to queue.
+#   2018.03.19  Allow user to retry a failed job.
+#   2018.05.10  Added more descriptive usage when invoked with no arguments.
+#   2018.05.10  Allow user to hold and release jobs.
+#   2018.05.16  Improved polling for watch mode.
+#   2018.09.18  Added command for editing a queue entry.
+#   2019.01.11  Allow retry for DONE state as well as FAIL state.
+#   2019.05.26  Added commands for displaying the head and tail of a queue.
+#   2019.07.06  Allow selecting of jobs by existing priority for new priority.
+#   2020.05.17  Set UTF-8 mode when reading job files, for proper display.
+#   2020.06.11  Set UTF-8 mode when reading STDIN.
+#   2021.08.12  Allow comma-separated list of actions.
+#   2022.02.10  Display job ID column more compactly.
+#   2022.12.20  Allow specific quantity of items in head and tail displays.
+#
+# Author:  Todd S. Lehman
+#
+
+use strict;
+use Fcntl qw(:flock);
+use utf8;
+binmode(STDIN, ":utf8");
+binmode(STDOUT, ":utf8");
+
+sub otherwise (&) { $_[0] }
+sub try (&;$) { eval { $_[0]->(); 1 } or do { $_[1] && $_[1]->(); 0 } }
+
+$| = 1;
+
+#-------------------------------------------------------------------------------
+chop(my $TERM_COLS = `tput cols`);
+$TERM_COLS =~ m/^\d+$/ or die;
+my $MAX_LINE_LEN = $TERM_COLS - 1;
+
+#-------------------------------------------------------------------------------
+my $TRUE  = 1;
+my $FALSE = 0;
+
+chop(my $CWD = `pwd`);
+
+my $STATE_DONE    = "done";
+my $STATE_ACTIVE  = "active";
+my $STATE_TODO    = "todo";
+my $STATE_FAIL    = "fail";
+my $STATE_HOLD    = "hold";
+my @STATES        = ($STATE_DONE,
+                     $STATE_ACTIVE,
+                     $STATE_TODO,
+                     $STATE_FAIL,
+                     $STATE_HOLD);
+my %STATE_ORDER   = ($STATE_DONE    => 1,
+                     $STATE_ACTIVE  => 2,
+                     $STATE_TODO    => 3,
+                     $STATE_FAIL    => 4,
+                     $STATE_HOLD    => 5);
+
+my %STATE_SYMBOLS = (
+  $STATE_TODO    => " ",
+  $STATE_ACTIVE  => "\x{25B6}",  # ▶ Right-pointing triangle
+  $STATE_DONE    => "\x{2713}",  # ✓ Check mark
+  $STATE_FAIL    => "!",
+  $STATE_HOLD    => "?",
+);
+
+my $QUEUE_DIR   = "$::ENV{HOME}/.queue";
+
+sub state_dir($) { my ($state) = @_; return "$QUEUE_DIR/$state"; }
+
+my $TODO_DIR    = state_dir($STATE_TODO);
+my $ACTIVE_DIR  = state_dir($STATE_ACTIVE);
+my $DONE_DIR    = state_dir($STATE_DONE);
+my $FAIL_DIR    = state_dir($STATE_FAIL);
+my $HOLD_DIR    = state_dir($STATE_HOLD);
+
+my $LOCK_PATH   = "$QUEUE_DIR/.lock";
+my $COUNT_PATH  = "$QUEUE_DIR/.count";
+my $LIMIT_PATH  = "$QUEUE_DIR/.limit";
+my $PAUSE_PATH  = "$QUEUE_DIR/.pause";
+my $MTIME_PATH  = "$QUEUE_DIR/.mtime";
+
+#-------------------------------------------------------------------------------
+sub shell_escape($)
+{
+  my ($x) = @_;
+  $x =~ s{([^a-zA-Z0-9_\-\+\=\.\,\/])}{\\$1}g;
+  return $x;
+}
+
+#-------------------------------------------------------------------------------
+sub job_path($$$)
+{
+  my ($state, $id, $priority) = @_;
+  return join("/", $QUEUE_DIR, $state, $id . $priority);
+}
+
+#-------------------------------------------------------------------------------
+sub error_exit($)
+{
+  my ($message) = @_;
+  print STDERR $message;
+  print STDERR "\n" if $message !~ /\n/;
+  exit(1);
+}
+
+#-------------------------------------------------------------------------------
+my %HELP;
+
+$HELP{'help'} = <<EOM;
+    help
+        Displays help for all subcommands, plus additional background.
+
+    help <subcommand>
+        Displays help for a given subcommand.
+EOM
+
+$HELP{'add'} = <<EOM;
+    add [<pri>]
+        Enqueues one or more jobs from standard input (one per line) and
+        launches a queue runner as a background process if none are running.
+        If a priority is specified, all commands are enqueued with the given
+        priority.  If no priority is specified, the default priority (none)
+        is assumed.  Valid priorities are lowercase letters 'a' through 'z'.
+EOM
+
+$HELP{'remove'} = <<EOM;
+    remove [<id> ...]
+        Removes one or more jobs from the queue.
+EOM
+
+$HELP{'move'} = <<EOM;
+    move <srcid ...> <dstid>    [UNIMPLEMENTED]
+        Moves one or more jobs to a new location in the queue by renumbering
+        the job ID or IDs.
+EOM
+
+$HELP{'hold'} = <<EOM;
+    hold <id> ...
+        Marks unstarted jobs as unavailable for processing, without removing
+        them from the queue.  Internally, this changes the state of a job
+        from 'todo' to 'hold'.
+EOM
+
+$HELP{'release'} = <<EOM;
+    release <id> ...
+        Marks held jobs as available again for processing, without altering
+        their position in the queue, and launches new queue runners if
+        necessary.  Internally, this changes the state of a job from 'hold'
+        to 'todo'.
+EOM
+
+$HELP{'retry'} = <<EOM;
+    retry <id> ...
+        Re-enqueues one or more failed or completed jobs for reprocessing.
+        Internally, this changes the state of a job from 'fail' (or 'done')
+        to 'todo' and removes any previously collected output.  Jobs
+        re-enqueued in this way retain their original ordinal number but
+        lose their original priority.
+EOM
+
+$HELP{'priority'} = <<EOM;
+    priority <pri> <id>|<pri> ...
+        Assigns a different priority to one or more jobs.  The list of jobs can
+        be given by id or by existing priority.
+EOM
+
+$HELP{'edit'} = <<EOM;
+    edit <id> ...
+        Edits the raw data in the queue database for the specified job ID or
+        IDs.  The environment variable "EDITOR" must be defined and determines
+        which text editor to invoke.  The queue database is locked during the
+        editing process.  This option should be used only by advanced users.
+EOM
+
+$HELP{'list'} = <<EOM;
+    list
+        Lists all jobs in the queue.
+
+    list todo|active|done|fail|hold
+        Lists all jobs in the specified state.
+
+    list <id> ...
+        Lists all jobs matching the specified job ID or IDs.
+EOM
+
+$HELP{'head'} = <<EOM;
+    head [<limit>]
+        Lists the first few jobs in the queue.  (Default limit is 10.)
+EOM
+
+$HELP{'tail'} = <<EOM;
+    tail [<limit>]
+        Lists the last few jobs in the queue.  (Default limit is 10.)
+EOM
+
+$HELP{'status'} = <<EOM;
+    status
+        Displays a summary of the current status, consisting of the
+        following information:  Total job count ("total"), number of
+        unstarted jobs remaining ("todo"), number of successfully completed
+        jobs ("done"), number of unsuccessfully completed jobs ("fail"),
+        number of active jobs ("active"), the number of held jobs ("hold"),
+        the current limit of queue runners ("limit"), and the run state of
+        the queue ("paused").
+EOM
+
+$HELP{'pause'} = <<EOM;
+    pause
+        Enter "paused" state and cease dispatching new jobs.  Currently
+        active jobs continue execution to their natural completion.  Any
+        active queue runners are directed to exit as soon as their active
+        job completes.
+EOM
+
+$HELP{'resume'} = <<EOM;
+    resume
+        Exit "paused" state and resume dispatching new jobs.  Launches one
+        or more queue runners in the background, if needed.
+EOM
+
+$HELP{'limit'} = <<EOM;
+    limit
+        Displays the current maximum allowed number of simultaneous queue
+        runners for parallel processing of jobs.
+
+    limit <limit>
+        Raises or lowers the maximum number of queue runners.  If the new
+        limit is higher than the current limit, new queue runners are
+        launched as background processes.  If the new limit is lower than
+        the current limit, one or more queue runners are directed to
+        complete their current job and exit at their earliest convenience.
+EOM
+
+$HELP{'frontier'} = <<EOM;
+    frontier
+        Displays the frontier of the queue, that is, a subset of jobs
+        consisting of those most recently completed, most soon to be
+        dispatched, and any currently executing jobs.
+EOM
+   
+$HELP{'watch'} = <<EOM;
+    watch
+        Enters a non-interactive queue-monitoring mode which displays the
+        queue's frontier and refreshes the display upon changes to the queue.
+        Monitoring mode is exited by pressing Ctrl-C.
+EOM
+
+$HELP{'clean'} = <<EOM;
+    clean
+        Removes all completed jobs.  Does not remove unstarted jobs, active
+        jobs, or failed jobs.
+EOM
+
+$HELP{'reset'} = <<EOM;
+    reset
+        Resets the job ID counter to zero.  A prerequisite for this is that
+        the queue must be empty.
+EOM
+
+$HELP{'job_id'} = <<EOM;
+    <id> ...
+        Displays the job file for the specified job ID number or numbers.
+        If the job is in the 'todo' or the 'active' state, the job file will
+        contain only the current working directory of the job and the job's
+        command line.  If the job is in the 'done' or 'fail' state, the job
+        file will also contain the collected standard output and standard
+        error streams from the job.
+EOM
+
+$HELP{'job_ids'} = <<EOM;
+JOB IDS
+    Job IDs are given to certain subcommands as a single number, a numeric
+    range, or a list consisting of any arbitrary collection of single
+    numbers and numeric ranges.  Examples appear below.
+
+        50            The single job ID 50.
+
+        100-199       The 100 job IDs from 100 through 199, inclusive.
+
+        1-3 5 9-99    The 95 job IDs 1, 2, 3, 5, and 9 through 99, inclusive.
+EOM
+
+$HELP{'job_formatting'} = <<EOM;
+JOB FORMATTING
+    When the queue's frontier is displayed, the following symbols appear at
+    the far left of the line, before the job's ID and command line:
+
+    $STATE_SYMBOLS{$STATE_ACTIVE}   Active job
+    $STATE_SYMBOLS{$STATE_TODO}   Unstarted job
+    $STATE_SYMBOLS{$STATE_DONE}   Successfully completed job
+    $STATE_SYMBOLS{$STATE_FAIL}   Unsuccessfully completed job
+    $STATE_SYMBOLS{$STATE_HOLD}   Held job
+EOM
+
+$HELP{'database'} = <<EOM;
+DATABASE
+    The following directories and files comprise a per-user database:
+
+    ~/.queue            Main database directory.
+    ~/.queue/.count     Counter representing the last-used job ID.
+    ~/.queue/.limit     Upper limit on the number of parallel queue runners.
+    ~/.queue/.lock      Internal lock file.
+    ~/.queue/.mtime     Last modification time of queue.
+    ~/.queue/todo       Directory containing unstarted jobs.
+    ~/.queue/active     Directory containing actively processing jobs.
+    ~/.queue/done       Directory containing successfully completed jobs.
+    ~/.queue/fail       Directory containing unsuccessfully completed jobs.
+    ~/.queue/hold       Directory containing held jobs.
+EOM
+
+#-------------------------------------------------------------------------------
+sub display_usage_exit()
+{
+  print "Usage: queue <subcommand> ...\n";
+  print "\n";
+  print "Subcommands:\n";
+
+  for my $subcommand (qw(help add remove move hold release retry priority edit
+                         list head tail status pause resume limit frontier watch
+                         clean reset))
+  {
+    my $help = $HELP{$subcommand};
+    next if $help =~ m/UNIMPLEMENTED/;
+    foreach (split(/\n/, $help))
+      { print "$_\n" if m/^    \S/; }
+  }
+
+  exit(0);
+}
+
+#-------------------------------------------------------------------------------
+sub display_help_exit(@)
+{
+  my (@subcommands) = @_;
+
+  if (@subcommands)
+  {
+    foreach my $subcommand (@subcommands)
+    {
+      if (exists($HELP{$subcommand}))
+        { print "\n", $HELP{$subcommand}; }
+      else
+        { error_exit("$subcommand:  No such subcommand"); }
+    }
+    exit(0);
+  }
+
+  print <<EOM;
+NAME
+    queue -- parallel job scheduler
+
+SYNOPSIS
+    queue subcommand ...
+
+DESCRIPTION
+    queue maintains a prioritized list of jobs, submitted as independently
+    operating command lines.  Entries in the queue are processed in order by
+    one or more "queue runners" acting in parallel as background processes.
+    A per-user database of entries is maintained in the ~/.queue directory.
+
+SUBCOMMANDS
+    The following subcommands are defined:
+
+$HELP{'help'}
+$HELP{'add'}
+$HELP{'remove'}
+$HELP{'move'}
+$HELP{'hold'}
+$HELP{'release'}
+$HELP{'retry'}
+$HELP{'priority'}
+$HELP{'list'}
+$HELP{'head'}
+$HELP{'tail'}
+$HELP{'status'}
+$HELP{'pause'}
+$HELP{'resume'}
+$HELP{'limit'}
+$HELP{'frontier'}
+$HELP{'watch'}
+$HELP{'clean'}
+$HELP{'reset'}
+$HELP{'job_id'}
+$HELP{'job_ids'}
+$HELP{'job_formatting'}
+$HELP{'database'}
+EOM
+
+  exit(0);
+}
+
+#-------------------------------------------------------------------------------
+my $lock_depth = 0;
+
+#-------------------------------------------------------------------------------
+sub obtain_lock()
+{
+  if ($lock_depth++ == 0)
+  {
+    open(LOCK, "+<", $LOCK_PATH)
+      or error_exit("Could not open $LOCK_PATH ($@)");
+    flock(LOCK, LOCK_EX)
+      or error_exit("Could not lock $LOCK_PATH ($@)");
+  }
+  return;
+}
+
+#-------------------------------------------------------------------------------
+sub release_lock()
+{
+  if (--$lock_depth == 0)
+  {
+    open(LOCK, "+<", $LOCK_PATH)
+      or error_exit("Could not open $LOCK_PATH ($@)");
+    flock(LOCK, LOCK_UN)
+      or error_exit("Could not unlock $LOCK_PATH ($@)");
+  }
+  return;
+}
+
+#-------------------------------------------------------------------------------
+sub prepare_dir($)
+{
+  my ($dir) = @_;
+
+  if (!-e $dir)
+  {
+    mkdir($dir) or error_exit("Could not create $dir ($@)");
+  }
+
+  -d $dir or error_exit("$dir is not a directory");
+  -r $dir or error_exit("$dir is not readable");
+  -w $dir or error_exit("$dir is not writeable");
+
+  return;
+}
+
+#-------------------------------------------------------------------------------
+sub read_first_line_of_file_chopped($)
+{
+  my ($path) = @_;
+
+  open(FILE, "<", $path) or error_exit("Could not read $path ($@)");
+  binmode(FILE, ":utf8");
+  my $contents = <FILE>;
+  if (defined($contents))
+    { chop($contents); }
+  close(FILE);
+
+  return $contents;
+}
+
+#-------------------------------------------------------------------------------
+sub read_second_line_of_file_chopped($)
+{
+  my ($path) = @_;
+
+  open(FILE, "<", $path) or error_exit("Could not read $path ($@)");
+  binmode(FILE, ":utf8");
+  my $contents = <FILE>;
+  $contents = <FILE>;
+  if (defined($contents))
+    { chop($contents); }
+  close(FILE);
+
+  return $contents;
+}
+
+#-------------------------------------------------------------------------------
+sub read_file($)
+{
+  my ($path) = @_;
+
+  open(FILE, "<", $path) or error_exit("Could not read $path ($@)");
+  binmode(FILE, ":utf8");
+  my $contents = do { local $/; <FILE> };
+  close(FILE);
+
+  return $contents;
+}
+
+#-------------------------------------------------------------------------------
+sub write_file($$)
+{
+  my ($path, $contents) = @_;
+
+  try
+  {
+    open(FILE, ">", $path) or die;
+    binmode(FILE, ":utf8");
+    print FILE $contents or die;
+    close(FILE) or die;
+  }
+  otherwise
+  {
+    error_exit("Could not create $path ($@)");
+  };
+
+  return;
+}
+
+#-------------------------------------------------------------------------------
+sub append_file($$)
+{
+  my ($path, $contents) = @_;
+
+  try
+  {
+    open(FILE, ">>", $path) or die;
+    binmode(FILE, ":utf8");
+    print FILE $contents or die;
+    close(FILE) or die;
+  }
+  otherwise
+  {
+    error_exit("Could not append $path ($@)");
+  };
+
+  return;
+}
+
+#-------------------------------------------------------------------------------
+sub prepare_file($$)
+{
+  my ($path, $contents) = @_;
+
+  if (!-e $path)
+    { write_file($path, $contents); }
+
+  -f $path or error_exit("$path is not a file");
+  -r $path or error_exit("$path is not readable");
+  -w $path or error_exit("$path is not writeable");
+
+  return;
+}
+
+#-------------------------------------------------------------------------------
+sub update_mtime()
+{
+  obtain_lock();
+  write_file($MTIME_PATH, sprintf("%d\n", time()));
+  release_lock();
+
+  return;
+}
+
+#-------------------------------------------------------------------------------
+sub get_mtime()
+{
+  my $mtime = (stat($MTIME_PATH))[9];
+  return $mtime;
+}
+
+#-------------------------------------------------------------------------------
+sub prepare_queue()
+{
+  prepare_dir($QUEUE_DIR);
+  prepare_dir($TODO_DIR);
+  prepare_dir($ACTIVE_DIR);
+  prepare_dir($DONE_DIR);
+  prepare_dir($FAIL_DIR);
+  prepare_dir($HOLD_DIR);
+
+  prepare_file($LOCK_PATH, "");
+  prepare_file($COUNT_PATH, "0\n");
+  prepare_file($LIMIT_PATH, "1\n");
+  prepare_file($MTIME_PATH, "0\n");
+
+  return;
+}
+
+#-------------------------------------------------------------------------------
+sub create_new_job_id()
+{
+  obtain_lock();
+
+  my $job_id;
+  try
+  {
+    open(COUNT, "+<", $COUNT_PATH) or die;
+    flock(COUNT, LOCK_EX) or die;
+    chop(my $last_job_id = <COUNT>);
+    $job_id = $last_job_id + 1;
+    seek(COUNT, 0, 0) or die; # rewind
+    print COUNT "$job_id\n" or die;
+    close(COUNT) or die;
+
+    update_mtime();
+  }
+  otherwise
+  {
+    error_exit("Could not increment job id ($@)");
+  };
+
+  release_lock();
+
+  return $job_id;
+}
+
+#-------------------------------------------------------------------------------
+sub job_command_line($)
+{
+  my ($job) = @_;
+  obtain_lock();
+  my $command_line = read_second_line_of_file_chopped($job->{path});
+  release_lock();
+  return $command_line;
+}
+
+#-------------------------------------------------------------------------------
+sub sort_jobs(@)
+{
+  return sort {
+    ($a->{state_order} <=> $b->{state_order}) ||
+    ($a->{priority}    cmp $b->{priority}) ||
+    ($a->{id}          <=> $b->{id})
+  } @_;
+}
+
+#-------------------------------------------------------------------------------
+sub job_with_id($$)
+{
+  my ($must_exist, $id) = @_;
+
+  obtain_lock();
+
+  my $job;
+
+  state: foreach my $state (@STATES)
+  {
+    my $state_dir = state_dir($state);
+    opendir(DIR, $state_dir)
+      or error_exit("Could not open $state_dir");
+    my @files = readdir(DIR);
+    closedir(DIR);
+
+    foreach my $file (@files)
+    {
+      if ($file =~ m/^$id([a-z]*)$/)
+      {
+        my ($priority) = $1;
+        my $path = job_path($state, $id, $priority);
+        -e $path or error_exit("Missing file $path");
+
+        $job =
+        {
+          id           => $id,
+          priority     => $priority,
+          state        => $state,
+          state_order  => $STATE_ORDER{$state},
+          path         => $path,
+        };
+
+        last state;
+      }
+    }
+  }
+
+  release_lock();
+
+  if (!$job && $must_exist)
+    { print "No job with id $id.\n"; }
+
+  return $job;
+}
+
+#-------------------------------------------------------------------------------
+sub jobs_with_ids($@)
+{
+  my ($must_exist, @ids) = @_;
+
+  obtain_lock();
+
+  my @jobs = grep { defined } map { job_with_id($must_exist, $_) } @ids;
+
+  release_lock();
+
+  return @jobs;
+}
+
+#-------------------------------------------------------------------------------
+sub jobs_with_id_ranges($@)
+{
+  my ($must_exist, @ranges) = @_;
+
+  obtain_lock();
+
+  my @jobs;
+  foreach my $range (@ranges)
+  {
+    if ($range =~ m/^(\d+)$/)
+      { push @jobs, jobs_with_ids($must_exist, $1); }
+    elsif ($range =~ m/^(\d+)-(\d+)$/)
+      { push @jobs, jobs_with_ids($must_exist,
+                                  ($1<=$2)? ($1..$2) : reverse($2..$1)); }
+    else
+      { display_help_exit('job_ids'); }
+  }
+
+  release_lock();
+
+  return @jobs;
+}
+
+#-------------------------------------------------------------------------------
+sub jobs_with_priority($)
+{
+  my ($priority) = @_;
+
+  return grep { $_->{priority} eq $priority } all_jobs();
+}
+
+#-------------------------------------------------------------------------------
+sub jobs_in_state($)
+{
+  my ($state) = @_;
+
+  my $dir = state_dir($state);
+
+  obtain_lock();
+  opendir(DIR, $dir) or error_exit("Could not open $dir ($@)");
+
+  my @jobs =
+    map
+    {
+      my $filename = $_;
+      my ($id, $priority) = ($filename =~ m/^(\d+)([a-z]*)$/);
+
+      {
+        id           => $id,
+        priority     => $priority,
+        state        => $state,
+        state_order  => $STATE_ORDER{$state},
+        path         => job_path($state, $id, $priority),
+      }
+    }
+    grep
+    {
+      !m/^\./
+    }
+    readdir(DIR);
+
+  @jobs = sort_jobs(@jobs);
+
+  closedir(DIR);
+  release_lock();
+
+  return @jobs;
+}
+
+#-------------------------------------------------------------------------------
+sub all_jobs()
+{
+  obtain_lock();
+  my @jobs = sort_jobs(map { jobs_in_state($_) } @STATES);
+  release_lock();
+  return @jobs;
+}
+
+#-------------------------------------------------------------------------------
+sub count_jobs_in_state($)
+{
+  my ($state) = @_;
+  my @job_ids = jobs_in_state($state);
+  return scalar(@job_ids);
+}
+
+#-------------------------------------------------------------------------------
+sub count_active_jobs()
+{
+  return count_jobs_in_state($STATE_ACTIVE);
+}
+
+#-------------------------------------------------------------------------------
+sub activate_next_job()
+{
+  obtain_lock();
+
+  # If the job id does not become defined, the program will exit gracefully.
+  my $job;
+
+  if (count_active_jobs() < get_limit())
+  {
+    my @jobs = jobs_in_state($STATE_TODO);
+    if (@jobs)
+    {
+      $job = $jobs[0];
+
+      $job->{oldpath} = $job->{path};
+      $job->{priority} = '';
+      $job->{state} = $STATE_ACTIVE;
+      $job->{path} = job_path($job->{state}, $job->{id}, $job->{priority});
+      rename($job->{oldpath}, $job->{path})
+        or error_exit("Could not activate job $job->{id} ($@)");
+
+      update_mtime();
+    }
+  }
+
+  release_lock();
+
+  return $job;
+}
+
+#-------------------------------------------------------------------------------
+sub execute_active_job($)
+{
+  my ($job) = @_;
+  $job && ($job->{state} eq 'active') or die;
+
+  my $stdout_path = "/tmp/queue.$job->{id}.stdout";
+  my $stderr_path = "/tmp/queue.$job->{id}.stderr";
+
+  my $sh_command_line = sprintf("nice -n 20 bash %s 1>%s 2>%s",
+                                $job->{path}, $stdout_path, $stderr_path);
+  my $system_result = system($sh_command_line);
+  if ($system_result == -1)
+    { error_exit("Failed to execute $job->{id} ($@)"); }
+  my $exit_signal = $system_result & 0xFF;
+  my $exit_value = $system_result >> 8;
+
+  if ($exit_signal != 0)
+    { append_file($job->{path}, "--- Exited with signal $exit_signal ---\n"); }
+
+  if ($exit_value != 0)
+    { append_file($job->{path}, "--- Exited with value $exit_value ---\n"); }
+
+  my $stdout_contents = "";
+  if (-f $stdout_path)
+  {
+    $stdout_contents = read_file($stdout_path);
+    unlink($stdout_path) or error_exit("Could not remove $stdout_path");
+  }
+
+  my $stderr_contents = "";
+  if (-f $stderr_path)
+  {
+    $stderr_contents = read_file($stderr_path);
+    unlink($stderr_path) or error_exit("Could not remove $stderr_path");
+  }
+
+  obtain_lock();
+
+  append_file($job->{path},
+              "--- STDOUT ---\n$stdout_contents" .
+              "--- STDERR ---\n$stderr_contents");
+
+  $job->{state} = ($exit_value == 0)? $STATE_DONE : $STATE_FAIL;
+  $job->{oldpath} = $job->{path};
+  $job->{path} = job_path($job->{state}, $job->{id}, $job->{priority});
+  rename($job->{oldpath}, $job->{path})
+    or error_exit("Could not deactivate job $job->{id} ($@)");
+
+  update_mtime();
+
+  release_lock();
+
+  return;
+}
+
+#-------------------------------------------------------------------------------
+sub execute_queued_jobs()
+{
+  while (1)
+  {
+    if (-f $PAUSE_PATH)
+      { sleep 1; next; }
+
+    my $job = activate_next_job();
+    last if !$job;
+
+    execute_active_job($job);
+  }
+
+  return;
+}
+
+#-------------------------------------------------------------------------------
+sub pause_queue()
+{
+  # --- If the queue is already paused, return immediately.
+  obtain_lock();
+  my $already_paused = -f $PAUSE_PATH && (count_active_jobs() == 0);
+  release_lock();
+  if ($already_paused)
+  {
+    print "Queue already paused.\n";
+    return;
+  }
+
+  # --- Create pause request flag if it is not already present.
+  obtain_lock();
+  if (!-f $PAUSE_PATH)
+  {
+    prepare_file($PAUSE_PATH, "");
+    update_mtime();
+  }
+  release_lock();
+
+  # --- Wait for active jobs to complete.
+  my $time_start = time();
+  my $time_waited = 0;
+  my $spin_counter = 0;
+  while (-f $PAUSE_PATH && ((my $active_jobs = count_active_jobs()) > 0))
+  {
+    printf "\rWaiting for %d active job%s to complete...  %s  ",
+           $active_jobs,
+           ($active_jobs == 1)? "":"s",
+           substr("|/-\\", ($spin_counter += 1) % 4, 1);
+    sleep 1;
+    $time_waited = time() - $time_start;
+  }
+  if ($time_waited > 0)
+    { print "\r", " " x 79, "\r"; }
+
+  # --- Report result.
+  if (-f $PAUSE_PATH)
+  {
+    printf "Queue paused (waited %d second%s).\n",
+           $time_waited, ($time_waited == 1)? "":"s";
+  }
+  else
+  {
+    printf "Queue resumed by another process.\n";
+  }
+
+  return;
+}
+
+#-------------------------------------------------------------------------------
+sub resume_queue()
+{
+  obtain_lock();
+  if (-f $PAUSE_PATH)
+  {
+    unlink($PAUSE_PATH)
+      or error_exit("Could not remove $PAUSE_PATH ($@)");
+    update_mtime();
+    print "Queue resumed.\n";
+  }
+  else
+  {
+    print "Queue already resumed.\n";
+  }
+  release_lock();
+  return;
+}
+
+#-------------------------------------------------------------------------------
+sub inject_job_with_command_line($$)
+{
+  my ($priority, $command_line) = @_;
+
+  obtain_lock();
+
+  my $job_id = create_new_job_id();
+  my $job_path = job_path($STATE_TODO, $job_id, $priority);
+  !-e $job_path or error_exit("$job_path already exists ($@)");
+  prepare_file($job_path, "cd @{[shell_escape($CWD)]}\n" . "$command_line\n");
+
+  release_lock();
+  return;
+}
+
+#-------------------------------------------------------------------------------
+sub inject_jobs_with_command_lines($@)
+{
+  my ($priority, @command_lines) = @_;
+
+  obtain_lock();
+
+  foreach my $command_line (@command_lines)
+    { inject_job_with_command_line($priority, $command_line); }
+
+  release_lock();
+  return;
+}
+
+#-------------------------------------------------------------------------------
+sub reprioritize_job($$)
+{
+  my ($priority, $job) = @_;
+  $job or return;
+
+  obtain_lock();
+
+  if ($job->{state} eq $STATE_ACTIVE)
+  {
+    printf "Job $job->{id} is already active.\n";
+  }
+  elsif ($job->{state} eq $STATE_DONE)
+  {
+    printf "Job $job->{id} is already done.\n";
+  }
+  elsif (($job->{state} eq $STATE_TODO) ||
+         ($job->{state} eq $STATE_HOLD) ||
+         ($job->{state} eq $STATE_FAIL))
+  {
+    if ($job->{priority} eq $priority)
+    {
+      printf "Job $job->{id} is already priority $priority.\n";
+    }
+    else
+    {
+      $job->{oldpath} = $job->{path};
+      $job->{priority} = $priority;
+      $job->{path} = job_path($job->{state}, $job->{id}, $job->{priority});
+      rename($job->{oldpath}, $job->{path})
+        or error_exit("Could not reprioritize job $job->{id} ($@)");
+
+      printf "Job $job->{id} is now priority $priority.\n";
+
+      update_mtime();
+    }
+  }
+  else
+  {
+    error_exit("Job $job->{id} has undefined state $job->{state}");
+  }
+
+  release_lock();
+  return;
+}
+
+#-------------------------------------------------------------------------------
+sub reprioritize_jobs($@)
+{
+  my ($priority, @jobs) = @_;
+
+  obtain_lock();
+
+  foreach my $job (@jobs)
+    { reprioritize_job($priority, $job); }
+
+  release_lock();
+  return;
+}
+
+#-------------------------------------------------------------------------------
+sub retry_job($)
+{
+  my ($job) = @_;
+  $job or return;
+
+  obtain_lock();
+
+  if (($job->{state} eq $STATE_DONE) || ($job->{state} eq $STATE_FAIL))
+  {
+    # Clear out old output/error log from this job.
+    my $line1 = read_first_line_of_file_chopped($job->{path});
+    my $line2 = read_second_line_of_file_chopped($job->{path});
+    write_file($job->{path}, "$line1\n$line2\n");
+
+    # Change state from DONE/FAIL to TODO and move job file.
+    $job->{state} = $STATE_TODO;
+    $job->{oldpath} = $job->{path};
+    $job->{path} = job_path($job->{state}, $job->{id}, $job->{priority});
+    rename($job->{oldpath}, $job->{path})
+      or error_exit("Could not retry job $job->{id} ($@)");
+
+    update_mtime();
+  }
+  else
+  {
+    printf "Job $job->{id} is not in done or failure state.\n";
+  }
+
+  release_lock();
+  return;
+}
+
+#-------------------------------------------------------------------------------
+sub retry_jobs(@)
+{
+  my (@jobs) = @_;
+
+  obtain_lock();
+
+  foreach my $job (@jobs)
+    { retry_job($job); }
+
+  release_lock();
+  return;
+}
+
+#-------------------------------------------------------------------------------
+sub hold_unstarted_job($)
+{
+  my ($job) = @_;
+  $job or return;
+
+  obtain_lock();
+
+  if ($job->{state} eq $STATE_TODO)
+  {
+    # Change state from TODO to HOLD and move job file.
+    $job->{state} = $STATE_HOLD;
+    $job->{oldpath} = $job->{path};
+    $job->{path} = job_path($job->{state}, $job->{id}, $job->{priority});
+    rename($job->{oldpath}, $job->{path})
+      or error_exit("Could not hold job $job->{id} ($@)");
+
+    update_mtime();
+  }
+  else
+  {
+    printf "Job $job->{id} is not in todo state.\n";
+  }
+
+  release_lock();
+  return;
+}
+
+#-------------------------------------------------------------------------------
+sub hold_unstarted_jobs(@)
+{
+  my (@jobs) = @_;
+
+  obtain_lock();
+
+  foreach my $job (@jobs)
+    { hold_unstarted_job($job); }
+
+  release_lock();
+  return;
+}
+
+#-------------------------------------------------------------------------------
+sub release_held_job($)
+{
+  my ($job) = @_;
+  $job or return;
+
+  obtain_lock();
+
+  if ($job->{state} eq $STATE_HOLD)
+  {
+    # Change state from HOLD to TODO and move job file.
+    $job->{state} = $STATE_TODO;
+    $job->{oldpath} = $job->{path};
+    $job->{path} = job_path($job->{state}, $job->{id}, $job->{priority});
+    rename($job->{oldpath}, $job->{path})
+      or error_exit("Could release held job $job->{id} ($@)");
+
+    update_mtime();
+  }
+  else
+  {
+    printf "Job $job->{id} is not in hold state.\n";
+  }
+
+  release_lock();
+  return;
+}
+
+#-------------------------------------------------------------------------------
+sub release_held_jobs(@)
+{
+  my (@jobs) = @_;
+
+  obtain_lock();
+
+  foreach my $job (@jobs)
+    { release_held_job($job); }
+
+  release_lock();
+  return;
+}
+
+#-------------------------------------------------------------------------------
+sub renumber_jobs($@)
+{
+  my ($new_job_id_min, @jobs) = @_;
+
+  my $new_job_id_max = $new_job_id_min + scalar(@jobs) - 1;
+
+  obtain_lock();
+
+  foreach my $new_job_id ($new_job_id_min .. $new_job_id_max)
+  {
+    if ((my $job = job_with_id($FALSE, $new_job_id)))
+    {
+      $job->{state} ne $STATE_ACTIVE
+        or error_exit("Cannot renumber onto active job $job->{id}.");
+    }
+  }
+
+  foreach my $job (@jobs)
+    { }
+  #update_mtime();
+
+  release_lock();
+  return;
+}
+
+#-------------------------------------------------------------------------------
+sub remove_job($)
+{
+  my ($job) = @_;
+  $job or return;
+
+  obtain_lock();
+
+  $job->{state} ne $STATE_ACTIVE
+    or error_exit("Cannot remove active job $job->{id}.");
+
+  unlink($job->{path})
+    or error_exit("Could not remove job $job->{id}");
+
+  print "Removed job $job->{id}\n";
+
+  update_mtime();
+
+  release_lock();
+  return;
+}
+
+#-------------------------------------------------------------------------------
+sub remove_jobs(@)
+{
+  my (@jobs) = @_;
+
+  obtain_lock();
+
+  foreach my $job (@jobs)
+    { remove_job($job); }
+
+  release_lock();
+  return;
+}
+
+#-------------------------------------------------------------------------------
+sub remove_done_jobs()
+{
+  obtain_lock();
+  remove_jobs(jobs_in_state($STATE_DONE));
+  release_lock();
+  return;
+}
+
+#-------------------------------------------------------------------------------
+sub reset_queue_counter()
+{
+  obtain_lock();
+
+  my @jobs = all_jobs();
+  if (@jobs > 0)
+    { error_exit("Reset requires that the queue must be empty."); }
+
+  write_file($COUNT_PATH, "0\n");
+  printf("Job id counter reset to 0.\n");
+
+  update_mtime();
+
+  release_lock();
+  return;
+}
+
+#-------------------------------------------------------------------------------
+sub edit_jobs(@)
+{
+  my (@jobs) = @_;
+
+  @jobs or return;
+
+  defined($::ENV{EDITOR})
+    or error_exit("EDITOR environment variable not defined.");
+
+  obtain_lock();
+
+  foreach my $job (@jobs)
+  {
+    $job->{state} ne $STATE_ACTIVE
+      or error_exit("Cannot edit active job $job->{id}.");
+  }
+
+  my $cmd = join(" ", $::ENV{EDITOR}, map { "\Q$_->{path}\E" } @jobs);
+  system($cmd);
+  update_mtime();
+
+  release_lock();
+  return;
+}
+
+#-------------------------------------------------------------------------------
+sub list_jobs($@)
+{
+  my ($max_line_length, @jobs) = @_;
+
+  obtain_lock();
+
+  my $job_id_width = 1;
+  foreach my $job (@jobs)
+  {
+    if (length($job->{id}) > $job_id_width)
+      { $job_id_width = length($job->{id}); }
+  }
+
+  foreach my $job (@jobs)
+  {
+    my $priority = ($job->{state} eq 'active')? '*' : $job->{priority};
+    my $line = sprintf "%s%*d %-1s  %s",
+      $STATE_SYMBOLS{$job->{state}},
+      1 + $job_id_width,
+      $job->{id},
+      $priority? $priority:"",
+      read_second_line_of_file_chopped($job->{path});
+
+    if (defined($max_line_length))
+      { $line = substr($line, 0, $max_line_length); }
+
+    print "$line\n";
+  }
+
+  release_lock();
+  return;
+}
+
+#-------------------------------------------------------------------------------
+sub list_jobs_at_frontier($)
+{
+  my ($max_line_length) = @_;
+
+  obtain_lock();
+
+  my @past_jobs    = jobs_in_state($STATE_DONE);
+  my @jobs         = jobs_in_state($STATE_ACTIVE);
+  my @future_jobs  = (jobs_in_state($STATE_TODO),
+                      jobs_in_state($STATE_FAIL),
+                      jobs_in_state($STATE_HOLD));
+
+  while ((@jobs < 15 - 1) && (@past_jobs || @future_jobs))
+  {
+    unshift(@jobs, pop(@past_jobs)) unless !@past_jobs;
+    push(@jobs, shift(@future_jobs)) unless !@future_jobs;
+  }
+  if (@jobs < 15)
+  {
+    push(@jobs, shift(@future_jobs)) unless !@future_jobs;
+  }
+
+  list_jobs($max_line_length, @jobs);
+
+  release_lock();
+  return;
+}
+
+#-------------------------------------------------------------------------------
+sub list_jobs_in_state($$)
+{
+  my ($max_line_length, $state) = @_;
+  obtain_lock();
+  list_jobs($max_line_length, jobs_in_state($state));
+  release_lock();
+  return;
+}
+
+#-------------------------------------------------------------------------------
+sub list_all_jobs($;$)
+{
+  my ($max_line_length, $max_count) = @_;
+  obtain_lock();
+  my @jobs = all_jobs();
+  if (defined($max_count))
+  {
+    $max_count = ($max_count >  scalar(@jobs))?   scalar(@jobs):
+                 ($max_count < -scalar(@jobs))?  -scalar(@jobs):
+                                                 $max_count;
+    @jobs = ($max_count >= 0)
+              ? splice(@jobs, 0,                           $max_count)
+              : splice(@jobs, scalar(@jobs) + $max_count, -$max_count);
+  }
+  list_jobs($max_line_length, @jobs);
+  release_lock();
+  return;
+}
+
+#-------------------------------------------------------------------------------
+sub start_new_queue_runners($)
+{
+  my ($quantity) = @_;
+
+  for (1 .. $quantity)
+  {
+    system("(queue process &)") == 0
+      or error_exit("Could not start new queue runner");
+  }
+
+  return;
+}
+
+#-------------------------------------------------------------------------------
+sub start_new_queue_runners_if_necessary()
+{
+  obtain_lock();
+
+  my $active_jobs = count_active_jobs();
+  my $current_limit = get_limit();
+
+  if ($active_jobs < $current_limit)
+    { start_new_queue_runners($current_limit - $active_jobs); }
+
+  release_lock();
+  return;
+}
+
+#-------------------------------------------------------------------------------
+sub get_limit()
+{
+  obtain_lock();
+  my $limit = read_first_line_of_file_chopped($LIMIT_PATH);
+  release_lock();
+  return $limit;
+}
+
+#-------------------------------------------------------------------------------
+sub set_limit($)
+{
+  my ($new_limit) = @_;
+
+  my $MAX_LIMIT = 64;
+  $new_limit <= $MAX_LIMIT or error_exit("The maximum limit is $MAX_LIMIT.");
+
+  my $current_limit = get_limit();
+
+  obtain_lock();
+
+  if ($new_limit == $current_limit)
+  {
+    print "Limit is already $new_limit.\n";
+  }
+  else
+  {
+    my ($message, $change);
+
+    write_file($LIMIT_PATH, "$new_limit\n");
+
+    if ($new_limit < $current_limit)
+    {
+      $change = $current_limit - $new_limit;
+
+      $message = "Lowering limit from %d to %d:  " .
+                 "%d queue runner%s will cease operation.\n";
+      # Note: They will cancel themselves as soon as they are able.
+    }
+    elsif ($new_limit > $current_limit)
+    {
+      $change = $new_limit - $current_limit;
+
+      $message = "Raising limit from %d to %d:  " .
+                 "%d queue runner%s will begin operation.\n";
+
+      start_new_queue_runners($change);
+    }
+
+    if ($change != 0)
+      { update_mtime(); }
+
+    printf $message,
+           $current_limit,
+           $new_limit,
+           $change,
+           ($change == 1)? "":"s";
+  }
+
+  if (-f $PAUSE_PATH)
+    { print "Note:  The queue is currently paused.\n"; }
+
+  release_lock();
+  return;
+}
+
+#-------------------------------------------------------------------------------
+sub print_limit()
+{
+  printf "limit:  %6d\n", get_limit();
+  return;
+}
+
+#-------------------------------------------------------------------------------
+sub print_job_details($)
+{
+  my ($job) = @_;
+  return if !$job;
+
+  obtain_lock();
+
+  -f $job->{path} or error_exit("Missing file for job $job->{id}");
+  print read_file($job->{path});
+
+  release_lock();
+  return;
+}
+
+#-------------------------------------------------------------------------------
+sub print_status()
+{
+  obtain_lock();
+
+  my %counts;
+  $counts{''} = 0;
+  foreach my $state (@STATES)
+  {
+    $counts{$state} = count_jobs_in_state($state);
+    $counts{''} += $counts{$state};
+  }
+
+  printf "%-7s %6d\n", "total:", $counts{''};
+  foreach my $state
+    ($STATE_TODO, $STATE_DONE, $STATE_FAIL, $STATE_ACTIVE, $STATE_HOLD)
+  {
+    my $count = $counts{$state};
+    my $ratio = ($counts{''} > 0)? $count / $counts{''} : undef;
+    if (defined($ratio))
+      { printf "%-7s %6d %8s\n", "$state:", $count,
+          sprintf("(%.1f%%)", $ratio * 100); }
+    else
+      { printf "%-7s %6d\n", "$state:", $count; }
+  }
+
+  print_limit();
+
+  my $is_paused = (-f $PAUSE_PATH);
+  printf "%-7s %6s\n", "paused:", $is_paused? "YES":"no";
+
+  release_lock();
+  return;
+}
+
+#-------------------------------------------------------------------------------
+sub watch_queue()
+{
+  my $last_mtime = -1;
+
+  while (1)
+  {
+    my $mtime = get_mtime();
+
+    if ($mtime > $last_mtime)
+    {
+      obtain_lock();
+      system("clear");
+      print_status();
+      print "\n";
+      list_jobs_at_frontier($MAX_LINE_LEN);
+      my $done = (count_jobs_in_state($STATE_ACTIVE) == 0) &&
+                 (count_jobs_in_state($STATE_TODO)   == 0) &&
+                 (count_jobs_in_state($STATE_FAIL)   == 0);
+      release_lock();
+
+      $last_mtime = $mtime;
+    }
+
+    sleep(1);
+  }
+}
+
+#-------------------------------------------------------------------------------
+sub execute_action_with_arguments($@)
+{
+  my ($action, @args) = @_;
+
+  if ($action =~ m/^\d+/)
+  {
+    unshift(@args, $action);
+    obtain_lock();
+    foreach my $job (jobs_with_id_ranges($TRUE, @args))
+      { print_job_details($job); }
+    release_lock();
+  }
+  elsif ($action eq 'add')
+  {
+    my $priority = @args? shift(@args) : '';
+    chop(my @command_lines = <STDIN>);
+    inject_jobs_with_command_lines($priority, @command_lines);
+    start_new_queue_runners_if_necessary();
+  }
+  elsif ($action eq 'priority')
+  {
+    @args >= 2 or display_help_exit('priority');
+    my $priority = shift(@args);
+    obtain_lock();
+    foreach my $arg (@args)
+    {
+      if ($arg =~ m/^[a-z]?$/)
+        { reprioritize_jobs($priority, jobs_with_priority($arg)); }
+      elsif ($arg =~ m/^([0-9]+|[0-9]+-[0-9]+)$/)
+        { reprioritize_jobs($priority, jobs_with_id_ranges($TRUE, $arg)); }
+      else
+        { error_exit(qq{Bad argument "$arg"}); }
+    }
+    release_lock();
+  }
+  elsif ($action eq 'edit')
+  {
+    @args >= 1 or display_help_exit('edit');
+    edit_jobs(jobs_with_id_ranges($TRUE, @args));
+  }
+  elsif ($action eq 'list')
+  {
+    if (@args)
+    {
+      foreach my $arg (@args)
+      {
+        if ($arg =~ m/^[a-z]?$/)
+          { list_jobs(undef, jobs_with_priority($arg)); }
+        elsif ($arg =~ m/^([a-z]+)$/)
+          { list_jobs_in_state(undef, $1); }
+        elsif ($arg =~ m/^([0-9]+|[0-9]+-[0-9]+)$/)
+          { list_jobs(undef, jobs_with_id_ranges($FALSE, $1)); }
+        else
+          { error_exit(qq{Bad argument "$arg"}); }
+      }
+    }
+    else
+    {
+      list_all_jobs(undef);
+    }
+  }
+  elsif ($action eq 'head')
+  {
+    my $limit;
+    if (@args == 0)
+      { $limit = 10; }
+    elsif ((@args == 1) && ($args[0] =~ m/^\d+$/))
+      { $limit = $args[0]; }
+    else
+      { display_help_exit('head'); }
+    list_all_jobs(undef, $limit);
+  }
+  elsif ($action eq 'tail')
+  {
+    my $limit;
+    if (@args == 0)
+      { $limit = 10; }
+    elsif ((@args == 1) && ($args[0] =~ m/^\d+$/))
+      { $limit = $args[0]; }
+    else
+      { display_help_exit('tail'); }
+    list_all_jobs(undef, -$limit);
+  }
+  elsif ($action eq 'frontier')
+  {
+    !@args or display_help_exit('frontier');
+    list_jobs_at_frontier(undef);
+  }
+  elsif ($action eq 'watch')
+  {
+    @args == 0 or display_help_exit('watch');
+    watch_queue();
+  }
+  elsif ($action eq 'status')
+  {
+    !@args or display_help_exit('status');
+    print_status();
+  }
+  elsif ($action eq 'limit')
+  {
+    if (@args == 0)
+      { print_limit(); }
+    elsif ((@args == 1) && ($args[0] =~ m/^\d+$/))
+      { set_limit($args[0]); }
+    else
+      { display_help_exit('limit'); }
+  }
+  elsif ($action eq 'pause')
+  {
+    !@args or display_help_exit('pause');
+    pause_queue();
+  }
+  elsif ($action eq 'resume')
+  {
+    !@args or display_help_exit('resume');
+    resume_queue();
+  }
+  elsif ($action eq 'process')
+  {
+    !@args or display_help_exit('process');
+    if (get_limit() > 0)
+      { execute_queued_jobs(); }
+    else
+      { print "Limit is 0.  Set limit to at least 1 to process jobs.\n"; }
+  }
+  elsif ($action eq 'move')
+  {
+    @args >= 2 or display_help_exit('move');
+    my $new_job_id_min = pop(@args);
+    $new_job_id_min =~ m/^\d+$/
+      or display_help_exit('move');  # Disallow range in final argument.
+    renumber_jobs($new_job_id_min, jobs_with_id_ranges($TRUE, @args));
+  }
+  elsif ($action eq 'retry')
+  {
+    @args or display_help_exit('retry');
+    retry_jobs(jobs_with_id_ranges($TRUE, @args));
+    start_new_queue_runners_if_necessary();
+  }
+  elsif ($action eq 'hold')
+  {
+    @args or display_help_exit('hold');
+    hold_unstarted_jobs(jobs_with_id_ranges($TRUE, @args));
+  }
+  elsif ($action eq 'release')
+  {
+    @args or display_help_exit('release');
+    release_held_jobs(jobs_with_id_ranges($TRUE, @args));
+    start_new_queue_runners_if_necessary();
+  }
+  elsif ($action eq 'remove')
+  {
+    @args or display_help_exit('remove');
+    remove_jobs(jobs_with_id_ranges($TRUE, @args));
+  }
+  elsif ($action eq 'clean')
+  {
+    !@args or display_help_exit('clean');
+    remove_done_jobs();
+  }
+  elsif ($action eq 'reset')
+  {
+    !@args or display_help_exit('reset');
+    reset_queue_counter();
+  }
+  elsif ($action eq 'help')
+  {
+    display_help_exit(@args);
+  }
+  else
+  {
+    display_help_exit();
+  }
+
+  return;
+}
+
+#===============================================================================
+prepare_queue();
+
+my $action = shift(@ARGV);
+
+if (!defined($action))
+{
+  display_usage_exit();
+}
+
+foreach $action (split(/,/, $action))
+{
+  execute_action_with_arguments($action, @ARGV);
+}
+
+exit 0;
+
